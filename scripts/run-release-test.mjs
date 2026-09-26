@@ -20,7 +20,8 @@ import { useRetirementStore } from '@/stores/retirement'
 import { uid, makeToken } from '@/utils/format'
 import {
   GATE, RELEASE_STATE, CHECK_KEY, CHECK_STATUS, CHECK_SEVERITY,
-  publishedSnapshot, isDocGated, evaluateGateChecks, canSignOffCheck, canRecheckGate
+  publishedSnapshot, isDocGated, evaluateGateChecks, canSignOffCheck, canRecheckGate,
+  rollbackConflictReason, isCandidateStale
 } from '@/utils/release'
 import { canEditDoc } from '@/utils/permission'
 import { isShareActive } from '@/utils/share'
@@ -530,6 +531,144 @@ const g5 = release.gatesOfDoc(d5.id)[0]
 assert(g5 && g5.status === GATE.WITHDRAWN && g5.timeline.some((t) => t.action === 'doc-delete'), '在途门禁随文档删除关闭并留痕')
 const citCount = await db.qaCitations.where('docId').equals(d5.id).count()
 assert(citCount === 0, '问答引用记录随文档清理')
+
+// ---------- 14. 连续发布与回退的版本链约束 ----------
+console.log('\n[14] 连续发布 / 回退的版本链约束（LIFO + 在途联动 + 并发防护）')
+
+// 纯函数：回退冲突判定
+{
+  const docV = (v) => ({ release: { state: RELEASE_STATE.NORMAL, publishedVersion: v } })
+  const gA = { id: 'ga', status: GATE.RELEASED, version: 2, publishedVersion: 1 }
+  const gB = { id: 'gb', status: GATE.RELEASED, version: 3, publishedVersion: 2 }
+  const gOpen = { id: 'go', status: GATE.PENDING_APPROVAL, version: 4, publishedVersion: 3 }
+  assert(rollbackConflictReason(gB, { doc: docV(3), docGates: [gA, gB] }) === null, '纯函数：最新发布版 v3 可回退')
+  assert(rollbackConflictReason(gA, { doc: docV(3), docGates: [gA, gB] }) === 'superseded', '纯函数：已有后续发布 v3 时，回退 v2 被判 superseded')
+  assert(rollbackConflictReason(gB, { doc: docV(3), docGates: [gA, gB], openGate: gOpen }) === 'gated', '纯函数：存在在途门禁时回退被判 gated')
+  assert(rollbackConflictReason(gB, { doc: docV(3), docGates: [gA, gB], openReview: { id: 'rv' } }) === 'in-review', '纯函数：存在在途评审时回退被判 in-review')
+  assert(rollbackConflictReason(gB, { doc: docV(2), docGates: [gA, gB] }) === 'drift', '纯函数：文档发布指向漂移时回退被判 drift')
+  assert(isCandidateStale({ version: 2 }, { versions: [{}, {}, {}] }) === true, '纯函数：候选落后于最新版本判定 stale')
+  assert(isCandidateStale({ version: 3 }, { versions: [{}, {}, {}] }) === false, '纯函数：候选即最新版本不判 stale')
+}
+
+// 端到端：连续放行两版，尝试回退旧版必须被拒绝
+const dSeq = await mkDoc()
+await saveVersion(dSeq.id, { body: '<p>seq v2 内容</p>' }, owner)
+r = await release.submitGate({ docId: dSeq.id }, owner)
+const seqG1 = r.gate
+await confirmWholeGate(seqG1, owner)
+r = await release.decideGate(seqG1.id, 'approve', '', admin)
+assert(r.status === 'ok' && r.gate.status === GATE.RELEASED, '连续发布：v2 放行成功')
+
+await saveVersion(dSeq.id, { body: '<p>seq v3 内容</p>' }, owner)
+r = await release.submitGate({ docId: dSeq.id }, owner)
+const seqG2 = r.gate
+await confirmWholeGate(seqG2, owner)
+r = await release.decideGate(seqG2.id, 'approve', '', admin)
+assert(r.status === 'ok' && r.gate.status === GATE.RELEASED, '连续发布：v3 放行成功')
+const seqDoc3 = await getDoc(dSeq.id)
+assert(seqDoc3.release.publishedVersion === 3 && seqDoc3.body.includes('seq v3'), '当前对外版本为 v3')
+
+r = await release.rollbackGate(seqG1.id, '', admin)
+assert(r.status === 'superseded', '回退历史版本 v2 被拒绝：已有更新版本发布（superseded）')
+const seqDocUnchanged = await getDoc(dSeq.id)
+assert(seqDocUnchanged.release.publishedVersion === 3 && seqDocUnchanged.body.includes('seq v3'), '被拒绝的回退不改变正文与发布状态')
+const seqG1Still = release.gateById(seqG1.id)
+assert(seqG1Still.status === GATE.RELEASED, '被拒绝回退的旧门禁仍为已放行（未被错误标记为已回退）')
+
+// 发布后、回退前新产生的问答引用指向 v3：回退时必须一并恢复（不在放行清单里）
+const lateCit = await mkCitation(dSeq.id, '发布后才提出的新问题?', 3)
+
+// LIFO：先回退 v3 → v2 成功，v3 之后的新引用同步回 v2
+r = await release.rollbackGate(seqG2.id, 'v3 有问题', admin)
+assert(r.status === 'ok' && r.gate.status === GATE.ROLLED_BACK, '按顺序回退最新发布版 v3 成功')
+const seqDoc2 = await getDoc(dSeq.id)
+assert(seqDoc2.release.publishedVersion === 2 && seqDoc2.body.includes('seq v2') && !seqDoc2.body.includes('seq v3'), '回退 v3 后正文/发布状态正确回到 v2')
+const lateCitAfter = await db.qaCitations.get(lateCit.id)
+assert(lateCitAfter.docVersion === 2, '发布后产生、指向 v3 的引用也随回退恢复到 v2（不遗漏）')
+
+// 此时 v2 成为最新发布版，可继续回退到 v1；v2 发布期间切换的引用恢复到 v1
+r = await release.rollbackGate(seqG1.id, '', admin)
+assert(r.status === 'ok', 'v3 回退后，v2 重新成为最新发布版，可回退到 v1')
+const seqDoc1 = await getDoc(dSeq.id)
+assert(seqDoc1.release.publishedVersion === 1 && seqDoc1.body.includes('旧正文'), '连续 LIFO 回退后正文回到 v1')
+assert((await db.qaCitations.get(lateCit.id)).docVersion === 1, '同一引用随链式回退恢复到 v1')
+
+// 端到端：存在在途门禁时，回退任何已放行版本都被拒绝
+const dGated = await mkDoc()
+await saveVersion(dGated.id, { body: '<p>gated v2</p>' }, owner)
+r = await release.submitGate({ docId: dGated.id }, owner)
+const gatedG1 = r.gate
+await confirmWholeGate(gatedG1, owner)
+r = await release.decideGate(gatedG1.id, 'approve', '', admin)
+assert(r.status === 'ok', '在途门禁联动场景：v2 先放行')
+await saveVersion(dGated.id, { body: '<p>gated v3 候选</p>' }, owner)
+r = await release.submitGate({ docId: dGated.id }, owner)
+const gatedG2 = r.gate // v3 在途
+assert(['blocked', 'ok'].includes(r.status), 'v3 门禁建立（可能带阻断）')
+r = await release.rollbackGate(gatedG1.id, '', admin)
+assert(r.status === 'superseded' || r.status === 'gated', '在途门禁期间旧发布版不可回退')
+r = await release.rollbackGate(gatedG1.id, '', admin)
+// 即便 v3 在途门禁被撤回前，也不允许用 v2 回退破坏其发布基线
+await release.withdrawGate(gatedG2.id, owner)
+// 撤回后 v2 重新成为最新发布版，可回退（基线已被撤回门禁清掉）
+r = await release.rollbackGate(gatedG1.id, '', admin)
+assert(r.status === 'ok', '在途门禁撤回后，最新发布版 v2 可正常回退')
+
+// 端到端：在途评审单阻断回退（防止评审通过旁路写入越过回退）
+const dRevRb = await mkDoc()
+await saveVersion(dRevRb.id, { body: '<p>rev-rb v2</p>' }, owner)
+r = await release.submitGate({ docId: dRevRb.id }, owner)
+const revRbG = r.gate
+await confirmWholeGate(revRbG, owner)
+await release.decideGate(revRbG.id, 'approve', '', admin)
+const rrBlock = await review.submitReview(dRevRb.id, {
+  title: (await getDoc(dRevRb.id)).title,
+  body: '<p>rev-rb v3 待审</p>',
+  categoryId: 'c', tagIds: [], visibility: 'public'
+}, '回退期间补评审', admin)
+assert(rrBlock.status === 'ok', '已发布版本上可发起评审单')
+r = await release.rollbackGate(revRbG.id, '', admin)
+assert(r.status === 'in-review', '存在流转中评审单时回退被拒绝（in-review）')
+assert((await getDoc(dRevRb.id)).release.publishedVersion === 2, '评审阻断下回退不改变发布状态')
+// 门禁在途期间，评审「通过并发布」写版本也必须被拦截
+const dMidRev = await mkDoc()
+await saveVersion(dMidRev.id, { body: '<p>mid-gate v2 候选</p>' }, owner)
+r = await release.submitGate({ docId: dMidRev.id }, owner)
+const midGate = r.gate
+const midRev = await review.submitReview(dMidRev.id, {
+  title: (await getDoc(dMidRev.id)).title,
+  body: '<p>旁路写版 vX</p>',
+  categoryId: 'c', tagIds: [], visibility: 'public'
+}, '门禁中发起', admin)
+assert(midRev.status === 'ok', '门禁在途期间允许发起评审（作为评审维度阻断留档）')
+r = await review.decideReview(midRev.review.id, 'approve', '', admin)
+assert(r.status === 'in-gate', '门禁在途期间评审通过写版本被拦截（in-gate）')
+const midDocAfter = await getDoc(dMidRev.id)
+assert(!midDocAfter.body.includes('旁路写版'), '被拦截的评审通过未回写正文')
+assert(midDocAfter.versions.length === 2, '被拦截的评审通过未追加版本（版本链不被旁路破坏）')
+// 驳回评审解除占用后，门禁仍可正常放行
+await review.decideReview(midRev.review.id, 'reject', '', admin)
+await confirmWholeGate(release.gateById(midGate.id), admin)
+r = await release.decideGate(midGate.id, 'approve', '', admin)
+assert(r.status === 'ok', '评审结案后门禁放行恢复正常')
+
+// 端到端：门禁在途期间产生并发新版本 → 放行被阻止（stale），不静默覆盖
+const dStale = await mkDoc()
+await saveVersion(dStale.id, { body: '<p>stale v2 候选</p>' }, owner)
+r = await release.submitGate({ docId: dStale.id }, owner)
+const staleGate = r.gate
+await confirmWholeGate(staleGate, owner)
+// 管理员在门禁在途期间直接保存了 v3（管理员不受门禁编辑锁限制）
+await saveVersion(dStale.id, { body: '<p>stale v3 并发新版</p>' }, admin)
+r = await release.decideGate(staleGate.id, 'approve', '', admin)
+assert(r.status === 'stale', '候选 v2 已落后于并发产生的 v3，放行被阻止（stale）')
+const staleDoc = await getDoc(dStale.id)
+assert(staleDoc.release.state === RELEASE_STATE.GATED && staleDoc.body.includes('stale v3'), 'stale 阻止后文档不被旧候选覆盖（保留最新内容与门禁标记）')
+const staleGateRec = release.gateById(staleGate.id)
+assert(staleGateRec.status === GATE.PENDING_APPROVAL, '被阻止的门禁仍停留在待审批，可撤回后基于 v3 重新发起')
+assert(staleGateRec.timeline.some((t) => t.action === 'approve-stale'), '阻止放行的原因写入门禁留痕')
+r = await release.withdrawGate(staleGate.id, owner)
+assert(r.status === 'ok', '撤回落后门禁成功，可基于最新版本重新发起')
 
 console.log(`\n结果：${passed} 通过，${failed} 失败`)
 process.exit(failed ? 1 : 0)

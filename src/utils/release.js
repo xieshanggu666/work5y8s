@@ -482,6 +482,58 @@ export function canRollbackGate(gate, userId, role) {
   return isGateReleased(gate) && !isGuestUser(userId) && role === ROLE.ADMIN
 }
 
+// ---- 连续发布 / 回退的版本链约束 ----
+// 发布只能「追加」：门禁放行的候选版本必须仍是文档当前最新版本；
+// 回退只能「后进先出（LIFO）」：仅当前对外生效的发布版可回退，且回退时不得存在
+// 在途门禁或在途评审——否则回退会用旧快照覆盖后续新版，造成正文、发布状态与
+// 问答引用错位。并发提交时由调用方在写事务内传入实时实体重新判定。
+
+// 放行新鲜度：候选版本是否仍是最新版本（门禁在途期间可能有管理员保存的并发新版）
+export function isCandidateStale(gate, doc) {
+  if (!gate || !doc) return false
+  const latest = doc.versions?.length || 1
+  return latest > gate.version
+}
+
+// 回退前置约束判定。ctx:
+// { openGate（同文档在途门禁，含阻断态，可空）, openReview（同文档在途评审单，可空）,
+//   doc（事务内最新文档，可空）, docGates（同文档全部门禁，用于查后续已放行版本） }
+// 返回 null 表示允许回退；否则返回冲突原因：
+//   'gated'      同文档存在在途门禁（候选/基线仍在变动，须先撤回或完成）
+//   'in-review'  同文档存在在途评审（通过会旁路写入版本，须先在评审通道结案）
+//   'superseded' 已有更新的版本经门禁放行（仅最新发布版可回退，LIFO）
+//   'drift'      文档实际发布状态与该门禁不一致（并发操作已改变发布指向）
+export function rollbackConflictReason(gate, ctx = {}) {
+  if (!gate) return 'drift'
+  const openGate = ctx.openGate
+  if (openGate && openGate.id !== gate.id && isGateOpen(openGate)) return 'gated'
+  // 仅查到同文档的其他在途门禁（调用方未直接给出 openGate 时兜底）
+  if (!openGate && Array.isArray(ctx.docGates)
+    && ctx.docGates.some((g) => g.id !== gate.id && isGateOpen(g))) return 'gated'
+  if (ctx.openReview) return 'in-review'
+  // 后续已有更新的已放行门禁（按候选版本号判断；同版本不可能重复放行）
+  const laterReleased = (ctx.docGates || []).some(
+    (g) => g.id !== gate.id && g.status === GATE.RELEASED && g.version >= gate.version
+  )
+  if (laterReleased) return 'superseded'
+  // 文档当前发布指向必须正是本次门禁发布的版本，否则说明并发操作已改变发布基线
+  const doc = ctx.doc
+  if (doc?.release && doc.release.publishedVersion != null
+    && doc.release.publishedVersion !== gate.version) return 'drift'
+  return null
+}
+
+// 回退冲突原因的面向用户提示
+export function rollbackConflictLabel(reason, gate) {
+  const to = gate ? 'v' + gate.version : '该版本'
+  return {
+    gated: '该文档存在在途发布门禁，请先撤回或完成门禁后再回退 ' + to,
+    'in-review': '该文档存在流转中的评审单，请先由管理员驳回或撤回评审后再回退 ' + to,
+    superseded: '已有更新的版本发布，仅可回退当前最新发布版（先按发布顺序回退后续版本）',
+    drift: '文档发布状态已变化（' + to + ' 不是当前对外版本），请刷新后重试'
+  }[reason] || '当前不允许回退该版本'
+}
+
 // ---- 影响项 ----
 
 // 去重生成影响项键（同类型同实体只保留一条）
@@ -620,6 +672,7 @@ export function gateTimelineLabel(action) {
     'impact-confirm-item': '逐项确认影响',
     'impact-confirm-all': '整体确认影响',
     approve: '管理员审批放行',
+    'approve-stale': '放行被阻止：候选版本已落后于最新版本',
     reject: '管理员审批驳回',
     withdraw: '撤回升版门禁',
     rollback: '管理员回退版本',

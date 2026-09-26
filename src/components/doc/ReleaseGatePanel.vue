@@ -151,7 +151,15 @@ async function decide(g, decision) {
   if (res.status === 'ok') { decideNote.value = { ...decideNote.value, [g.id]: '' } }
   else if (res.status === 'denied' || res.status === 'guest') alert('只有管理员可以审批放行或驳回。')
   else if (res.status === 'blocked') alert('放行前复检发现新的阻断维度，门禁已退回阻断态：\n' + (res.blocking || []).map((b) => '· ' + b.reason).join('\n'))
+  else if (res.status === 'stale') alert('放行被阻止：候选 v' + g.version + ' 已不是最新版本（门禁期间产生了并发修改）。请撤回门禁后基于最新版本重新发起。')
   else alert('操作失败：门禁状态已变化')
+}
+
+const ROLLBACK_BLOCK_HINT = {
+  gated: '该文档存在在途发布门禁，请先撤回或完成门禁',
+  'in-review': '该文档存在流转中的评审单，请先在评审通道结案',
+  superseded: '已有更新版本发布，请先按顺序回退后续版本',
+  drift: '文档发布状态已变化，请刷新后重试'
 }
 
 async function rollback(g) {
@@ -159,6 +167,7 @@ async function rollback(g) {
   const res = await releaseStore.rollbackGate(g.id, (rollbackNote.value[g.id] || '').trim(), auth.user)
   if (res.status === 'ok') { rollbackNote.value = { ...rollbackNote.value, [g.id]: '' } }
   else if (res.status === 'denied' || res.status === 'guest') alert('只有管理员可以回退已放行版本。')
+  else if (ROLLBACK_BLOCK_HINT[res.status]) alert(ROLLBACK_BLOCK_HINT[res.status])
   else alert('操作失败：门禁状态已变化')
 }
 

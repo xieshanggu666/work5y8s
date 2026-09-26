@@ -62,6 +62,7 @@ async function decide(r, decision) {
     const res = await reviewStore.decideReview(r.id, decision, (noteMap.value[r.id] || '').trim(), auth.user)
     if (res.status === 'ok') noteMap.value[r.id] = ''
     else if (res.status === 'guest' || res.status === 'denied') alert('只有管理员可以审批评审单。')
+    else if (res.status === 'in-gate') alert('该文档存在在途发布门禁：请先撤回/完成门禁，或驳回本评审单；评审通过会与门禁的版本发布冲突。')
     else alert('操作失败：评审单状态已变化')
   } finally {
     busyId.value = ''

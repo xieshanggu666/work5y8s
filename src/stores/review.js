@@ -9,6 +9,7 @@ import { CORRECTION } from '@/utils/correction'
 import { canEditContent, GUEST_ID } from '@/utils/permission'
 import { isGrantActive, ACCESS_PERM } from '@/utils/access'
 import { isFreshReview, isFreshNoChangeReview } from '@/utils/review'
+import { isGateStatusOpen } from '@/utils/release'
 import { isDocOverride, materializeFromPolicy, isFreshTicketOpen } from '@/utils/freshness'
 import { useKbStore } from './kb'
 import { useGapStore } from './gap'
@@ -451,7 +452,7 @@ export const useReviewStore = defineStore('review', () => {
     const userId = currentUser?.id || GUEST_ID
     let result = { status: 'error' }
 
-    await db.transaction('rw', db.docs, db.reviews, db.gapTickets, db.freshnessTickets, db.freshnessPolicies, db.correctionTickets, async () => {
+    await db.transaction('rw', db.docs, db.reviews, db.gapTickets, db.freshnessTickets, db.freshnessPolicies, db.correctionTickets, db.releaseGates, async () => {
       const review = await db.reviews.get(reviewId)
       if (!review) { result = { status: 'missing' }; return }
       if (review.status !== REVIEW.PENDING) { result = { status: 'closed', review }; return }
@@ -466,6 +467,19 @@ export const useReviewStore = defineStore('review', () => {
       if (!doc) { result = { status: 'doc-missing' }; return }
 
       const status = decision === 'approve' ? REVIEW.APPROVED : REVIEW.REJECTED
+      // 发布门禁在途期间，评审「通过并发布」不得写版本：评审通过会直接回写快照并追加版本，
+      // 与门禁的候选版本 / 已发布基线互斥（放行将覆盖门禁候选、回退会被评审新版本越过）。
+      // 管理员须先在门禁通道撤回/结案，或驳回该评审；保鲜「确认无需修订」不改内容，允许通过。
+      if (status === REVIEW.APPROVED && !isFreshNoChangeReview(review)) {
+        const openGate = await db.releaseGates
+          .where('docId').equals(review.docId)
+          .filter((g) => isGateStatusOpen(g.status)).first()
+        if (openGate) {
+          result = { status: 'in-gate', gateId: openGate.id }
+          return
+        }
+      }
+
       const timeline = [
         ...(review.timeline || []),
         buildTimelineEntry(status === REVIEW.APPROVED ? 'approve' : 'reject', userId, note, now)

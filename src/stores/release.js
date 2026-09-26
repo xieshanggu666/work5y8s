@@ -11,7 +11,8 @@ import {
   normalizeImpacts, markImpactConfirmed, allImpactsConfirmed,
   markImpactsReleased, markImpactsReset, impactCounts,
   restoreConfirmedImpacts, evaluateGateChecks, mergeChecks, signOffGateCheck,
-  allChecksCleared, blockingReasons, buildGateEntry
+  allChecksCleared, blockingReasons, buildGateEntry,
+  isCandidateStale, rollbackConflictReason
 } from '@/utils/release'
 import { canEditDoc, GUEST_ID, ROLE } from '@/utils/permission'
 import { isGrantActive, ACCESS_PERM } from '@/utils/access'
@@ -628,6 +629,24 @@ export const useReleaseStore = defineStore('release', () => {
           return
         }
 
+        // ---- 放行前并发版本校验：门禁在途期间若有更新的版本被保存（管理员直接保存 /
+        // 评审通道等旁路写入），候选版本已不是最新，放行会用旧候选覆盖新版 → 拒绝放行，
+        // 由发起人撤回当前门禁后基于最新版本重新发起（留痕说明，门禁保持待审批）----
+        if (isCandidateStale(gate, doc)) {
+          const latest = ensureVersions(doc, now).length
+          const staleGate = {
+            ...gate,
+            timeline: [
+              ...(gate.timeline || []),
+              buildGateEntry('approve-stale', 'system', '放行被阻止：候选 v' + gate.version
+                + ' 已落后于当前最新 v' + latest + '（在途期间产生了并发版本），请撤回门禁后基于最新版本重新发起', now)
+            ]
+          }
+          await db.releaseGates.put(staleGate)
+          result = { status: 'stale', gate: staleGate, latestVersion: latest }
+          return
+        }
+
         // ---- 放行前最终复检：流转期间可能新出现阻断（如保鲜到点、被纳入他人退役替代链）----
         const ctx = await collectChecksCtxTx(gate.docId, doc)
         const nextChecks = evaluateGateChecks({ ...ctx, doc }, now)
@@ -755,7 +774,10 @@ export const useReleaseStore = defineStore('release', () => {
     return result
   }
 
-  // 回退已放行版本：正文/问答引用恢复到门禁前发布版，链接状态还原
+  // 回退已放行版本（LIFO 版本链约束）：
+  // 仅当前对外生效的发布版可回退，且同文档不得存在在途门禁 / 在途评审；
+  // 事务内实时复核，杜绝并发操作（连续放行、在途审批、评审旁路写版）导致的错位。
+  // 回退时正文回到门禁前发布版，问答引用 / 共享链接按当前实时状态联动还原。
   async function rollbackGate(gateId, note, currentUser) {
     const kb = useKbStore()
     await loadAll()
@@ -765,7 +787,7 @@ export const useReleaseStore = defineStore('release', () => {
 
     await db.transaction(
       'rw',
-      db.releaseGates, db.docs, db.shares, db.gapTickets, db.qaCitations,
+      db.releaseGates, db.docs, db.shares, db.gapTickets, db.qaCitations, db.reviews,
       async () => {
         const gate = await db.releaseGates.get(gateId)
         if (!gate) { result = { status: 'missing' }; return }
@@ -776,6 +798,23 @@ export const useReleaseStore = defineStore('release', () => {
         const doc = await db.docs.get(gate.docId)
         if (!doc) { result = { status: 'doc-missing' }; return }
 
+        // ---- 事务内实时版本链约束：在途门禁 / 在途评审 / 后续已放行版本 / 发布指向漂移 ----
+        const liveDocGates = await db.releaseGates.where('docId').equals(gate.docId).toArray()
+        const liveOpenGate = liveDocGates.find((g) => isGateOpen(g)) || null
+        const liveOpenReview = await db.reviews
+          .where('docId').equals(gate.docId)
+          .filter((rv) => rv.status === 'pending').first() || null
+        const conflict = rollbackConflictReason(gate, {
+          openGate: liveOpenGate,
+          openReview: liveOpenReview,
+          doc,
+          docGates: liveDocGates
+        })
+        if (conflict) {
+          result = { status: conflict }
+          return
+        }
+
         const snap = gate.publishedSnapshot
         // ① 文档正文回退到门禁前发布版（保留版本历史，被回退版本打标）
         const restoredInfo = {
@@ -785,11 +824,15 @@ export const useReleaseStore = defineStore('release', () => {
           publishedSnapshot: { ...snap, tagIds: [...(snap.tagIds || [])] },
           updatedAt: now
         }
-        // ② 问答引用恢复旧版本号（仅还原本门禁切换过、且当前仍指向新版本的记录）
+        // ② 问答引用：实时恢复所有当前仍指向本次发布版本的记录。
+        //    既覆盖门禁放行时切换的（effects.releasedCitationIds），也覆盖发布后、
+        //    回退前新产生但指向被回退版本的引用——后者不在放行清单里，漏还会造成引用错位。
+        //    LIFO 约束保证此刻不存在更新的已发布版本，故指向 gate.version 的引用全部归本次回退所有。
         const restoredCitationIds = []
-        for (const cid of gate.effects?.releasedCitationIds || []) {
-          const c = await db.qaCitations.get(cid)
-          if (!c || c.gateId !== gate.id || c.docVersion !== gate.version) continue
+        const citesAtVersion = await db.qaCitations
+          .where('docId').equals(doc.id)
+          .filter((c) => (c.docVersion ?? 0) === gate.version).toArray()
+        for (const c of citesAtVersion) {
           await db.qaCitations.update(c.id, { docVersion: gate.publishedVersion, gateRolledBackAt: now })
           restoredCitationIds.push(c.id)
         }
@@ -803,11 +846,13 @@ export const useReleaseStore = defineStore('release', () => {
           })
           restoredTicketIds.push(t.id)
         }
-        // ④ 共享链接：清除本次发布同步标记（链接仍有效，访问内容随文档回退自动恢复旧版）
+        // ④ 共享链接：实时清除本次发布写入的同步标记（链接仍有效，访问内容随正文回退自动恢复旧版）。
+        //    同样不依赖放行清单，覆盖放行后被补同步标记的情况。
         const restoredShareIds = []
-        for (const sid of gate.effects?.syncedShareIds || []) {
-          const s = await db.shares.get(sid)
-          if (!s || s.gateId !== gate.id) continue
+        const markedShares = await db.shares
+          .where('docId').equals(doc.id)
+          .filter((s) => s.gateId === gate.id).toArray()
+        for (const s of markedShares) {
           await db.shares.update(s.id, { gateId: null, gateVersion: null, gateSyncedAt: null, gateRolledBackAt: now })
           restoredShareIds.push(s.id)
         }

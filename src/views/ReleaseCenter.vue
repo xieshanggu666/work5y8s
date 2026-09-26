@@ -9,7 +9,7 @@ import { formatDate, formatFull } from '@/utils/format'
 import {
   GATE, gateStatusLabel, gateStatusCls, gateTimelineLabel,
   impactTypeLabel, impactStatusLabel, impactCounts, IMPACT,
-  CHECK_SEVERITY, canSignOffCheck, canRecheckGate
+  CHECK_SEVERITY, canSignOffCheck, canRecheckGate, rollbackConflictReason
 } from '@/utils/release'
 import { diffVersionFields, fieldLabels } from '@/utils/version'
 
@@ -133,17 +133,37 @@ async function decide(g, decision) {
     if (res.status === 'ok') decideNoteMap.value[g.id] = ''
     else if (res.status === 'denied' || res.status === 'guest') alert('只有管理员可以审批放行或驳回。')
     else if (res.status === 'blocked') alert('放行前复检发现新阻断，门禁已退回阻断态，请处置后再次送审。')
+    else if (res.status === 'stale') alert('放行被阻止：候选 v' + g.version + ' 已不是最新版本（门禁期间产生了并发修改）。请撤回门禁，基于最新版本重新发起。')
     else alert('操作失败：门禁状态已变化')
   } finally {
     busyId.value = ''
   }
 }
 
+// 已放行门禁的回退约束：仅当前最新发布版可回退（LIFO），存在在途门禁时禁止。
+// 约束在 store 事务内实时复核；这里用于禁用按钮并给出针对性提示。
+function rollbackBlockReason(g) {
+  if (g.status !== GATE.RELEASED) return null
+  const doc = docById.value[g.docId]
+  const docGates = releaseStore.gatesOfDoc(g.docId)
+  const openGate = docGates.find((x) => [GATE.BLOCKED, GATE.PENDING_CONFIRM, GATE.PENDING_APPROVAL].includes(x.status))
+  return rollbackConflictReason(g, { openGate: openGate || null, doc, docGates })
+}
+const ROLLBACK_BLOCK_HINT = {
+  gated: '存在在途发布门禁，请先撤回或完成门禁',
+  superseded: '已有更新版本发布，请先按顺序回退后续版本',
+  'in-review': '存在流转中评审单，请先在评审通道结案',
+  drift: '文档发布状态已变化，请刷新'
+}
+
 async function rollback(g) {
+  const block = rollbackBlockReason(g)
+  if (block) { alert(ROLLBACK_BLOCK_HINT[block] || '当前不允许回退该版本'); return }
   if (!confirm('确定回退 v' + g.version + '？问答引用与共享链接将恢复到 v' + g.publishedVersion + '。')) return
   const res = await releaseStore.rollbackGate(g.id, (rollbackNoteMap.value[g.id] || '').trim(), auth.user)
   if (res.status === 'ok') rollbackNoteMap.value[g.id] = ''
   else if (res.status === 'denied' || res.status === 'guest') alert('只有管理员可以回退版本。')
+  else if (ROLLBACK_BLOCK_HINT[res.status]) alert(ROLLBACK_BLOCK_HINT[res.status])
   else alert('操作失败：门禁状态已变化')
 }
 
@@ -275,11 +295,16 @@ onMounted(async () => {
         </div>
 
         <div v-if="g.status === GATE.RELEASED && isAdmin" class="acts released-acts">
-          <div class="released-hint">已放行：问答引用切换至 v{{ g.version }}，共享链接已同步新版内容。如发现问题可回退。</div>
-          <div class="act-row">
-            <input :value="rollbackNoteMap[g.id] || ''" placeholder="回退原因（可选）" @input="rollbackNoteMap[g.id] = $event.target.value" />
-            <button class="btn sm danger-ghost" @click="rollback(g)">↩ 回退至 v{{ g.publishedVersion }}</button>
-          </div>
+          <template v-if="rollbackBlockReason(g)">
+            <div class="released-hint blocked-hint">⛔ {{ ROLLBACK_BLOCK_HINT[rollbackBlockReason(g)] }}，当前不能回退 v{{ g.version }}</div>
+          </template>
+          <template v-else>
+            <div class="released-hint">已放行：问答引用切换至 v{{ g.version }}，共享链接已同步新版内容。仅最新发布版可回退。</div>
+            <div class="act-row">
+              <input :value="rollbackNoteMap[g.id] || ''" placeholder="回退原因（可选）" @input="rollbackNoteMap[g.id] = $event.target.value" />
+              <button class="btn sm danger-ghost" @click="rollback(g)">↩ 回退至 v{{ g.publishedVersion }}</button>
+            </div>
+          </template>
         </div>
 
         <details class="timeline">
@@ -377,7 +402,8 @@ onMounted(async () => {
 .btn.ok-solid:hover { background: #15803d; color: #fff; }
 .btn.danger-ghost { background: #fff; border-color: #f2555c; color: #b91c1c; }
 .btn.danger-ghost:hover { background: #fef2f2; }
-.released-hint { font-size: 12.5px; color: #15803d; margin-bottom: 8px; }
+.released-hint { font-size: 12.5px; color: var(--text-2); margin-bottom: 8px; }
+.blocked-hint { color: #b91c1c; background: #fef2f2; border-radius: 8px; padding: 8px 12px; margin-bottom: 0; }
 .timeline { margin-top: 10px; }
 .timeline summary { cursor: pointer; font-size: 12px; color: var(--text-3); }
 .tl { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; padding: 4px 0; font-size: 12px; }
