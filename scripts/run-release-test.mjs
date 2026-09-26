@@ -4,6 +4,9 @@
 // 硬阻断消除后重新评估 → 负责人逐项确认影响（含重新发起时的确认状态恢复）→
 // 管理员审批放行（版本发布、问答引用切新版、链接状态回写、放行前复检）/ 驳回/撤回 →
 // 管理员回退（正文/引用/链接还原）→ 门禁中编辑锁定、问答/搜索/共享访问只认已发布版、文档删除清理门禁。
+// 连续发布与回退的版本约束：历史放行回退被拦截（superseded，按发布逆序回退）、
+// 在途门禁期间禁止回退（gate-open）、候选滞后拒绝放行（stale，防并发覆盖）、
+// 放行后新增引用随回退按版本号全量还原。
 // 运行：npm run test:release
 import 'fake-indexeddb/auto'
 import { createApp } from 'vue'
@@ -20,7 +23,8 @@ import { useRetirementStore } from '@/stores/retirement'
 import { uid, makeToken } from '@/utils/format'
 import {
   GATE, RELEASE_STATE, CHECK_KEY, CHECK_STATUS, CHECK_SEVERITY,
-  publishedSnapshot, isDocGated, evaluateGateChecks, canSignOffCheck, canRecheckGate
+  publishedSnapshot, isDocGated, evaluateGateChecks, canSignOffCheck, canRecheckGate,
+  rollbackBlockReason, approveBlockReason
 } from '@/utils/release'
 import { canEditDoc } from '@/utils/permission'
 import { isShareActive } from '@/utils/share'
@@ -530,6 +534,110 @@ const g5 = release.gatesOfDoc(d5.id)[0]
 assert(g5 && g5.status === GATE.WITHDRAWN && g5.timeline.some((t) => t.action === 'doc-delete'), '在途门禁随文档删除关闭并留痕')
 const citCount = await db.qaCitations.where('docId').equals(d5.id).count()
 assert(citCount === 0, '问答引用记录随文档清理')
+
+// ---------- 14. 连续发布链：历史放行回退被拦截，按发布逆序回退 ----------
+console.log('\n[14] 连续发布链：历史放行回退拦截（superseded）+ 逆序回退')
+const dC = await mkDoc()
+await saveVersion(dC.id, { body: '<p>链式文档 v2 内容</p>' }, owner)
+const citC = await mkCitation(dC.id, '链式文档问题?', 1)
+const shareC = await mkShare(dC.id, 'view')
+let rC = await release.submitGate({ docId: dC.id }, owner)
+const gC1 = rC.gate
+await confirmWholeGate(gC1, owner)
+rC = await release.decideGate(gC1.id, 'approve', '', admin)
+assert(rC.status === 'ok' && rC.gate.status === GATE.RELEASED, '链式文档第一版放行 v2')
+// 连续第二版：v2 → v3
+await saveVersion(dC.id, { body: '<p>链式文档 v3 内容</p>' }, owner)
+rC = await release.submitGate({ docId: dC.id }, owner)
+const gC2 = rC.gate
+assert(gC2.version === 3 && gC2.publishedVersion === 2, '连续发布：第二门禁记录 v2→v3')
+await confirmWholeGate(gC2, owner)
+rC = await release.decideGate(gC2.id, 'approve', '', admin)
+assert(rC.status === 'ok' && rC.gate.status === GATE.RELEASED, '链式文档第二版放行 v3')
+const citC2 = await mkCitation(dC.id, '链式文档新问题?', 3) // 放行后新产生的引用（不经门禁 effects）
+// 历史回退拦截：v2 放行已被 v3 覆盖
+rC = await release.rollbackGate(gC1.id, '回退历史版本', admin)
+assert(rC.status === 'superseded', '历史放行（v2）已被后续发布覆盖，回退被拦截（superseded）')
+let dCNow = await getDoc(dC.id)
+assert(dCNow.body.includes('v3 内容') && dCNow.release.publishedVersion === 3, '拦截后正文与发布状态保持 v3 不被覆盖')
+// 逆序回退：先回退 v3，再回退 v2
+rC = await release.rollbackGate(gC2.id, '先回退最新', admin)
+assert(rC.status === 'ok' && rC.gate.status === GATE.ROLLED_BACK, '最新放行 v3 可回退')
+dCNow = await getDoc(dC.id)
+assert(dCNow.body.includes('v2 内容') && dCNow.release.publishedVersion === 2, '回退 v3 后正文/发布状态恢复 v2')
+const citC2Rb = await db.qaCitations.get(citC2.id)
+assert(citC2Rb.docVersion === 2, '放行后新产生的引用随回退还原到 v2（不属门禁 effects 也联动）')
+rC = await release.rollbackGate(gC1.id, '再回退 v2', admin)
+assert(rC.status === 'ok' && rC.gate.status === GATE.ROLLED_BACK, '后续版本已回退，v2 放行可继续回退（逆序）')
+dCNow = await getDoc(dC.id)
+assert(dCNow.body.includes('旧正文') && dCNow.release.publishedVersion === 1, '连续回退后正文/发布状态恢复 v1')
+const citCRb = await db.qaCitations.get(citC.id)
+assert(citCRb.docVersion === 1 && (await db.qaCitations.get(citC2.id)).docVersion === 1, '全部问答引用最终恢复 v1')
+const shareCRb = await db.shares.get(shareC.id)
+assert(isShareActive(shareCRb) && !shareCRb.gateId, '共享链接保持有效且发布同步标记已清理')
+
+// ---------- 15. 在途审批联动：存在在途门禁时回退被拦截 ----------
+console.log('\n[15] 在途审批联动：存在在途门禁时回退被拦截（gate-open）')
+const dF = await mkDoc()
+await saveVersion(dF.id, { body: '<p>在途联动 v2</p>' }, owner)
+let rF = await release.submitGate({ docId: dF.id }, owner)
+const gF1 = rF.gate
+await confirmWholeGate(gF1, owner)
+rF = await release.decideGate(gF1.id, 'approve', '', admin)
+assert(rF.status === 'ok', '在途联动：v2 放行')
+await saveVersion(dF.id, { body: '<p>在途联动 v3</p>' }, owner)
+rF = await release.submitGate({ docId: dF.id }, owner)
+assert(rF.status === 'ok', '在途联动：v3 门禁提交成功（在途）')
+const gF2 = rF.gate
+rF = await release.rollbackGate(gF1.id, '试图回退 v2', admin)
+assert(rF.status === 'gate-open', '存在在途门禁时回退被拦截（gate-open）')
+let dFNow = await getDoc(dF.id)
+assert(dFNow.release.publishedVersion === 2 && dFNow.release.activeGateId === gF2.id, '拦截后发布状态与在途门禁保持不变')
+// 在途门禁结案（撤回）后可回退
+await release.withdrawGate(gF2.id, owner)
+rF = await release.rollbackGate(gF1.id, '在途结案后回退', admin)
+assert(rF.status === 'ok' && rF.gate.status === GATE.ROLLED_BACK, '在途门禁撤回后回退成功')
+dFNow = await getDoc(dF.id)
+assert(dFNow.body.includes('旧正文') && dFNow.release.publishedVersion === 1, '回退后正文/发布状态恢复 v1')
+
+// ---------- 16. 并发操作防护：候选滞后拒绝放行（stale） ----------
+console.log('\n[16] 并发防护：门禁期间保存新版本，放行被版本约束拦截（stale）')
+const dS = await mkDoc()
+await saveVersion(dS.id, { body: '<p>并发防护 v2</p>' }, owner)
+let rS = await release.submitGate({ docId: dS.id }, owner)
+const gS1 = rS.gate
+await confirmWholeGate(gS1, owner)
+// 门禁待审批期间，管理员并发通道又保存了新版本（v3）
+await saveVersion(dS.id, { body: '<p>并发防护 v3 管理员修订</p>' }, admin)
+rS = await release.decideGate(gS1.id, 'approve', '', admin)
+assert(rS.status === 'stale' && rS.reason === 'stale', '候选之后存在更新版本，放行被拦截（stale）')
+const gS1Now = release.gateById(gS1.id)
+assert(gS1Now.status === GATE.PENDING_APPROVAL, '拦截后门禁保持待审批（不发布、不退回）')
+assert(gS1Now.timeline.some((t) => t.action === 'check-stale'), '版本约束拦截写入门禁时间线')
+let dSNow = await getDoc(dS.id)
+assert(dSNow.body.includes('v3 管理员修订') && dSNow.release.publishedVersion === 1, '并发修订内容不被放行覆盖，发布状态不变')
+// 撤回滞后门禁后以最新版本重新发起
+rS = await release.withdrawGate(gS1.id, owner)
+assert(rS.status === 'ok', '撤回滞后门禁成功')
+rS = await release.submitGate({ docId: dS.id }, owner)
+assert(rS.status === 'ok' && rS.gate.version === 3 && rS.gate.publishedVersion === 1, '撤回后以最新版本 v3 重新发起门禁')
+await confirmWholeGate(rS.gate, owner)
+rS = await release.decideGate(rS.gate.id, 'approve', '', admin)
+assert(rS.status === 'ok' && rS.gate.status === GATE.RELEASED, '最新候选放行成功')
+dSNow = await getDoc(dS.id)
+assert(dSNow.body.includes('v3 管理员修订') && dSNow.release.publishedVersion === 3, '放行后并发修订内容正式发布')
+
+// ---------- 17. 纯函数：回退/放行版本约束判定 ----------
+console.log('\n[17] 纯函数：回退/放行版本约束判定')
+const gRel = { id: 'g-p1', docId: 'd-p1', status: GATE.RELEASED, version: 2, publishedVersion: 1 }
+assert(rollbackBlockReason(gRel, { doc: { release: { publishedVersion: 2 } } }) === null, '最新放行版本可回退')
+assert(rollbackBlockReason(gRel, { doc: { release: { publishedVersion: 3 } } }) === 'superseded', '被后续发布覆盖 → superseded')
+assert(rollbackBlockReason(gRel, { doc: { release: { publishedVersion: 2 } }, openGate: { status: GATE.PENDING_APPROVAL } }) === 'gate-open', '存在在途门禁 → gate-open')
+assert(rollbackBlockReason(gRel, { gates: [{ id: 'g-p2', docId: 'd-p1', status: GATE.RELEASED, version: 3 }] }) === 'superseded', '无 release 信息时按放行记录判定 superseded')
+assert(rollbackBlockReason(gRel, { gates: [{ id: 'g-p2', docId: 'd-p1', status: GATE.ROLLED_BACK, version: 3 }] }) === null, '后续门禁已回退则不视为覆盖')
+assert(approveBlockReason({ version: 2, publishedVersion: 1 }, { release: { publishedVersion: 1 }, versions: [{}, {}] }) === null, '候选与基线一致可放行')
+assert(approveBlockReason({ version: 2, publishedVersion: 1 }, { release: { publishedVersion: 1 }, versions: [{}, {}, {}] }) === 'stale', '候选之后有新版本 → stale')
+assert(approveBlockReason({ version: 2, publishedVersion: 1 }, { release: { publishedVersion: 2 }, versions: [{}, {}] }) === 'baseline-moved', '基线被移动 → baseline-moved')
 
 console.log(`\n结果：${passed} 通过，${failed} 失败`)
 process.exit(failed ? 1 : 0)

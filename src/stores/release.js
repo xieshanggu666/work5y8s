@@ -11,7 +11,8 @@ import {
   normalizeImpacts, markImpactConfirmed, allImpactsConfirmed,
   markImpactsReleased, markImpactsReset, impactCounts,
   restoreConfirmedImpacts, evaluateGateChecks, mergeChecks, signOffGateCheck,
-  allChecksCleared, blockingReasons, buildGateEntry
+  allChecksCleared, blockingReasons, buildGateEntry,
+  rollbackBlockReason, approveBlockReason, approveBlockReasonLabel
 } from '@/utils/release'
 import { canEditDoc, GUEST_ID, ROLE } from '@/utils/permission'
 import { isGrantActive, ACCESS_PERM } from '@/utils/access'
@@ -34,7 +35,13 @@ import { useKbStore } from './kb'
 // 管理员审批放行（decideGate approve；放行前再次复检，阻断若复现则退回 blocked）：候选快照回写文档、
 //   追加发布版本标记、问答引用切换到新版、共享链接状态同步；
 //   驳回（reject）/编辑者撤回（withdraw）：版本不发布，文档保持已发布版；
-// 已放行版本管理员可回退（rollbackGate）：正文与问答引用恢复到发布前版本、链接状态还原。
+// 已放行版本管理员可回退（rollbackGate）：仅限「当前已发布」的最新放行版本（连续发布链按逆序回退；
+//   存在在途门禁时禁止回退，避免在途审批基线失效）；正文与问答引用（含放行后新增、仍指向被回退
+//   版本的引用）恢复到发布前版本、链接状态还原。
+// 版本约束（连续发布链一致性）：放行前复检候选/基线（approveBlockReason）——候选之后出现更新版本
+//   （管理员并发编辑/评审通道发布）或基线被移动时拒绝放行（stale），防止并发操作被静默覆盖；
+//   回退前校验 rollbackBlockReason——历史放行被后续发布覆盖时禁止回退，防止覆盖后续新版造成
+//   正文、发布状态与问答引用错位。
 // 驳回/撤回/回退后重新发起门禁：上一轮已逐项确认的影响自动恢复确认态（状态恢复）。
 // 全程在门禁单 timeline、版本记录门禁标记与各影响实体上留痕。
 export const useReleaseStore = defineStore('release', () => {
@@ -628,6 +635,18 @@ export const useReleaseStore = defineStore('release', () => {
           return
         }
 
+        // ---- 版本约束复检（连续发布链）：候选必须仍是文档最新版本、发布基线未被移动 ----
+        // 门禁流转期间管理员可并发保存、评审通道可发布新版本；若候选已滞后仍放行会覆盖更新版本
+        const staleReason = approveBlockReason(gate, doc)
+        if (staleReason) {
+          const timeline = [...(gate.timeline || []),
+            buildGateEntry('check-stale', 'system', approveBlockReasonLabel(staleReason), now)]
+          const stale = { ...gate, timeline }
+          await db.releaseGates.put(stale)
+          result = { status: 'stale', reason: staleReason, gate: stale }
+          return
+        }
+
         // ---- 放行前最终复检：流转期间可能新出现阻断（如保鲜到点、被纳入他人退役替代链）----
         const ctx = await collectChecksCtxTx(gate.docId, doc)
         const nextChecks = evaluateGateChecks({ ...ctx, doc }, now)
@@ -755,7 +774,9 @@ export const useReleaseStore = defineStore('release', () => {
     return result
   }
 
-  // 回退已放行版本：正文/问答引用恢复到门禁前发布版，链接状态还原
+  // 回退已放行版本：正文/问答引用恢复到门禁前发布版，链接状态还原。
+  // 版本约束：仅限「当前已发布」的最新放行版本（连续发布链按逆序回退）；
+  // 存在在途门禁时禁止回退（在途审批的基线即当前发布版，回退会令基线失效）。
   async function rollbackGate(gateId, note, currentUser) {
     const kb = useKbStore()
     await loadAll()
@@ -776,6 +797,12 @@ export const useReleaseStore = defineStore('release', () => {
         const doc = await db.docs.get(gate.docId)
         if (!doc) { result = { status: 'doc-missing' }; return }
 
+        // 版本约束（事务内复核）：在途门禁联动 + 历史放行不得覆盖后续新版
+        const docGates = await db.releaseGates.where('docId').equals(doc.id).toArray()
+        const openGate = docGates.find((g) => isGateOpen(g)) || null
+        const blockReason = rollbackBlockReason(gate, { doc, openGate, gates: docGates })
+        if (blockReason) { result = { status: blockReason, gate }; return }
+
         const snap = gate.publishedSnapshot
         // ① 文档正文回退到门禁前发布版（保留版本历史，被回退版本打标）
         const restoredInfo = {
@@ -785,11 +812,13 @@ export const useReleaseStore = defineStore('release', () => {
           publishedSnapshot: { ...snap, tagIds: [...(snap.tagIds || [])] },
           updatedAt: now
         }
-        // ② 问答引用恢复旧版本号（仅还原本门禁切换过、且当前仍指向新版本的记录）
+        // ② 问答引用恢复旧版本号：还原本文档当前仍指向被回退版本的全部引用——
+        // 含放行后新产生、不随门禁 effects 记录的引用，漏还原会造成引用与发布版错位
         const restoredCitationIds = []
-        for (const cid of gate.effects?.releasedCitationIds || []) {
-          const c = await db.qaCitations.get(cid)
-          if (!c || c.gateId !== gate.id || c.docVersion !== gate.version) continue
+        const affectedCites = await db.qaCitations
+          .where('docId').equals(doc.id)
+          .filter((c) => c.docVersion === gate.version).toArray()
+        for (const c of affectedCites) {
           await db.qaCitations.update(c.id, { docVersion: gate.publishedVersion, gateRolledBackAt: now })
           restoredCitationIds.push(c.id)
         }

@@ -8,7 +8,8 @@ import { formatFull, formatDate } from '@/utils/format'
 import {
   GATE, gateStatusLabel, gateStatusCls, gateTimelineLabel,
   impactTypeLabel, impactStatusLabel, IMPACT,
-  CHECK_SEVERITY, canSignOffCheck, canRecheckGate, allChecksCleared
+  CHECK_SEVERITY, canSignOffCheck, canRecheckGate, allChecksCleared,
+  rollbackBlockReason, rollbackBlockReasonLabel, approveBlockReason, approveBlockReasonLabel
 } from '@/utils/release'
 import { diffVersionFields, fieldLabels } from '@/utils/version'
 
@@ -55,6 +56,19 @@ const canSubmit = computed(() => {
 
 const isOwner = computed(() => props.doc.ownerId === auth.user?.id || auth.user?.role === 'admin')
 const isAdmin = computed(() => auth.user?.role === 'admin')
+
+// 在途门禁的放行版本约束：候选之后出现更新版本 / 发布基线被移动时不可放行（防并发覆盖）
+const openGateApproveBlock = computed(() =>
+  openGate.value && openGate.value.status === GATE.PENDING_APPROVAL
+    ? approveBlockReason(openGate.value, props.doc)
+    : null
+)
+// 最近一次放行门禁的回退版本约束：历史放行被后续发布覆盖 / 存在在途门禁时不可回退
+const lastGateRollbackBlock = computed(() => {
+  const g = lastGate.value
+  if (!g || g.status !== GATE.RELEASED) return null
+  return rollbackBlockReason(g, { doc: props.doc, openGate: openGate.value, gates: records.value })
+})
 
 function roleCtx() {
   return { userId: auth.user?.id, role: auth.user?.role, isOwner: props.doc.ownerId === auth.user?.id }
@@ -151,6 +165,7 @@ async function decide(g, decision) {
   if (res.status === 'ok') { decideNote.value = { ...decideNote.value, [g.id]: '' } }
   else if (res.status === 'denied' || res.status === 'guest') alert('只有管理员可以审批放行或驳回。')
   else if (res.status === 'blocked') alert('放行前复检发现新的阻断维度，门禁已退回阻断态：\n' + (res.blocking || []).map((b) => '· ' + b.reason).join('\n'))
+  else if (res.status === 'stale') alert('放行被版本约束拦截：' + approveBlockReasonLabel(res.reason))
   else alert('操作失败：门禁状态已变化')
 }
 
@@ -159,6 +174,8 @@ async function rollback(g) {
   const res = await releaseStore.rollbackGate(g.id, (rollbackNote.value[g.id] || '').trim(), auth.user)
   if (res.status === 'ok') { rollbackNote.value = { ...rollbackNote.value, [g.id]: '' } }
   else if (res.status === 'denied' || res.status === 'guest') alert('只有管理员可以回退已放行版本。')
+  else if (res.status === 'superseded') alert('该版本之后已有更新版本发布，请按发布逆序先回退后续版本。')
+  else if (res.status === 'gate-open') alert('该文档存在在途发布门禁，请先完成或撤回后再回退。')
   else alert('操作失败：门禁状态已变化')
 }
 
@@ -296,10 +313,11 @@ onMounted(() => releaseStore.loadAll())
 
         <!-- 管理员审批 -->
         <div v-if="openGate.status === GATE.PENDING_APPROVAL && isAdmin" class="go-decide">
+          <div v-if="openGateApproveBlock" class="go-stale-hint">⚠️ {{ approveBlockReasonLabel(openGateApproveBlock) }}</div>
           <textarea :value="decideNote[openGate.id] || ''" rows="2" placeholder="审批意见（可选，将写入留痕；放行前系统会再次复检四维度）" @input="decideNote[openGate.id] = $event.target.value"></textarea>
           <div class="go-acts">
             <button class="btn sm danger-ghost" @click="decide(openGate, 'reject')">✕ 驳回（不发布）</button>
-            <button class="btn sm ok-solid" @click="decide(openGate, 'approve')">✓ 审批放行并发布</button>
+            <button class="btn sm ok-solid" :disabled="!!openGateApproveBlock" @click="decide(openGate, 'approve')">✓ 审批放行并发布</button>
           </div>
         </div>
         <div v-else-if="openGate.status === GATE.PENDING_APPROVAL" class="go-wait">
@@ -321,9 +339,12 @@ onMounted(() => releaseStore.loadAll())
       <div class="gd-note" v-if="(lastGate.checks || []).some((c) => c.waiver)">
         本轮豁免：<template v-for="c in lastGate.checks.filter((x) => x.waiver)" :key="c.key">【{{ c.label }}】{{ userName(c.waiver.by) }} </template>
       </div>
-      <div v-if="isAdmin && lastGate.status === GATE.RELEASED" class="gd-rollback">
-        <input :value="rollbackNote[lastGate.id] || ''" placeholder="回退原因（可选）" @input="rollbackNote[lastGate.id] = $event.target.value" />
-        <button class="btn sm danger-ghost" @click="rollback(lastGate)">↩ 回退该版本</button>
+      <div v-if="isAdmin && lastGate.status === GATE.RELEASED">
+        <div v-if="lastGateRollbackBlock" class="gd-rollback-hint">⚠️ 暂不可回退：{{ rollbackBlockReasonLabel(lastGateRollbackBlock) }}</div>
+        <div v-else class="gd-rollback">
+          <input :value="rollbackNote[lastGate.id] || ''" placeholder="回退原因（可选）" @input="rollbackNote[lastGate.id] = $event.target.value" />
+          <button class="btn sm danger-ghost" @click="rollback(lastGate)">↩ 回退该版本</button>
+        </div>
       </div>
     </div>
 
@@ -426,6 +447,8 @@ onMounted(() => releaseStore.loadAll())
 .gd-note { margin-top: 6px; font-size: 12.5px; color: var(--text-2); }
 .gd-rollback { display: flex; gap: 8px; margin-top: 8px; }
 .gd-rollback input { flex: 1; border: 1px solid var(--border); border-radius: 6px; padding: 5px 10px; font-size: 12.5px; outline: none; }
+.gd-rollback-hint { margin-top: 8px; font-size: 12.5px; color: #b45309; }
+.go-stale-hint { font-size: 12.5px; color: #b45309; background: #fffbeb; border: 1px solid #fcd34d; border-radius: 8px; padding: 6px 10px; margin-bottom: 8px; }
 .gp-timeline { margin-top: 10px; }
 .gp-timeline summary { cursor: pointer; font-size: 12px; color: var(--text-3); }
 .tl { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; padding: 4px 0; font-size: 12px; }

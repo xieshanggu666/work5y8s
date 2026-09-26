@@ -8,7 +8,13 @@
 // 门禁流转中（blocked / pending_confirm / pending_approval）候选版本不对问答/搜索/共享访问暴露，
 // 对外内容一律为门禁发起时锁定的「已发布版」（doc.release.publishedSnapshot）。
 // 驳回/撤回/回退后重新发起门禁时，上一轮已逐项确认的影响自动恢复确认态（状态恢复）。
+// 连续发布与回退的版本约束（防历史回退/并发操作造成正文、发布状态与问答引用错位）：
+// - 放行前复检候选与基线（approveBlockReason）：候选之后出现更新版本（管理员并发编辑/评审通道发布）
+//   或发布基线被移动时拒绝放行，须撤回后以最新版本重新发起；
+// - 回退仅限「当前已发布」的最新放行版本（rollbackBlockReason）：历史放行被后续发布覆盖、
+//   或文档存在在途门禁（在途审批基线即当前发布版）时禁止回退，须按发布逆序先结案/回退后续版本。
 import { ROLE, isGuestUser } from './permission'
+import { docVersion } from './version'
 import { buildTimelineEntry } from './review'
 import { FRESH, isFreshDue, isFreshnessEnabled, isFreshTicketOpen } from './freshness'
 import { GAP } from './gap'
@@ -477,9 +483,55 @@ export function canDecideGate(gate, userId, role) {
   return isGatePendingApproval(gate) && !isGuestUser(userId) && role === ROLE.ADMIN
 }
 
-// 回退已放行版本：仅管理员；门禁须已放行
-export function canRollbackGate(gate, userId, role) {
-  return isGateReleased(gate) && !isGuestUser(userId) && role === ROLE.ADMIN
+// 回退已放行版本：仅管理员；门禁须已放行；传入 ctx 时叠加版本约束
+// （连续发布链上仅允许回退「当前已发布」的最新放行版本，且文档无在途门禁）
+export function canRollbackGate(gate, userId, role, ctx) {
+  if (!isGateReleased(gate) || isGuestUser(userId) || role !== ROLE.ADMIN) return false
+  return ctx ? rollbackBlockReason(gate, ctx) === null : true
+}
+
+// ---- 连续发布与回退的版本约束 ----
+
+// 回退的版本约束（在门禁已放行的前提下判定）：
+// - gate-open：文档存在在途门禁——在途审批的基线就是当前发布版，回退会令其基线失效
+// - superseded：该放行版本已被后续发布覆盖（不是当前已发布版本）——
+//   回退历史发布会覆盖后续新版，造成正文、发布状态与问答引用错位；须按发布逆序先回退后续版本
+// 返回 null 表示可回退。ctx: { doc, openGate, gates（该文档全部门禁，供无 release 信息时兜底判定） }
+export function rollbackBlockReason(gate, ctx = {}) {
+  if (!isGateReleased(gate)) return null
+  if (ctx.openGate && isGateOpen(ctx.openGate)) return 'gate-open'
+  const publishedVersion = ctx.doc?.release?.publishedVersion
+  if (publishedVersion != null && publishedVersion !== gate.version) return 'superseded'
+  const laterReleased = (ctx.gates || []).some((g) =>
+    g.id !== gate.id && g.docId === gate.docId && g.status === GATE.RELEASED && (g.version ?? 0) > (gate.version ?? 0))
+  return laterReleased ? 'superseded' : null
+}
+
+// 放行发布的版本约束（审批时点复检，并发操作防护）：
+// - baseline-moved：门禁流转期间发布基线被移动（防御性复检；正常已被回退的在途约束拦截）
+// - stale：提交门禁后又保存了新版本（管理员并发编辑/评审通道发布），
+//   仍按原候选放行会覆盖更新版本、造成正文与版本记录错位；须撤回后以最新版本重新发起
+// 返回 null 表示可按原候选放行
+export function approveBlockReason(gate, doc) {
+  if (!gate || !doc) return null
+  const publishedVersion = doc.release?.publishedVersion
+  if (publishedVersion != null && publishedVersion !== gate.publishedVersion) return 'baseline-moved'
+  if (docVersion(doc) !== gate.version) return 'stale'
+  return null
+}
+
+export function rollbackBlockReasonLabel(reason) {
+  return {
+    'gate-open': '文档存在在途发布门禁，须先完成或撤回后再回退',
+    superseded: '该版本之后已有更新版本发布，须按发布逆序先回退后续版本'
+  }[reason] || reason
+}
+
+export function approveBlockReasonLabel(reason) {
+  return {
+    stale: '候选版本之后又有新保存的版本，放行将覆盖最新编辑；请撤回本门禁后以最新版本重新发起',
+    'baseline-moved': '门禁流转期间已发布基线发生变化，候选与基线不再匹配；请撤回后重新发起'
+  }[reason] || reason
 }
 
 // ---- 影响项 ----
@@ -621,6 +673,7 @@ export function gateTimelineLabel(action) {
     'impact-confirm-all': '整体确认影响',
     approve: '管理员审批放行',
     reject: '管理员审批驳回',
+    'check-stale': '版本约束复检未通过（候选滞后/基线变化）',
     withdraw: '撤回升版门禁',
     rollback: '管理员回退版本',
     // 放行时的联动结果

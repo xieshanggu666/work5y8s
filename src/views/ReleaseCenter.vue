@@ -9,7 +9,8 @@ import { formatDate, formatFull } from '@/utils/format'
 import {
   GATE, gateStatusLabel, gateStatusCls, gateTimelineLabel,
   impactTypeLabel, impactStatusLabel, impactCounts, IMPACT,
-  CHECK_SEVERITY, canSignOffCheck, canRecheckGate
+  CHECK_SEVERITY, canSignOffCheck, canRecheckGate,
+  rollbackBlockReason, rollbackBlockReasonLabel, approveBlockReason, approveBlockReasonLabel
 } from '@/utils/release'
 import { diffVersionFields, fieldLabels } from '@/utils/version'
 
@@ -73,6 +74,20 @@ function changedFields(g) {
   return diffVersionFields(g.publishedSnapshot, g.candidateSnapshot)
 }
 
+// 回退的版本约束：历史放行被后续发布覆盖 / 文档存在在途门禁时不可回退（连续发布链按逆序回退）
+function rollbackBlock(g) {
+  return rollbackBlockReason(g, {
+    doc: docById.value[g.docId],
+    openGate: releaseStore.openGateOfDoc(g.docId),
+    gates: releaseStore.gates
+  })
+}
+// 放行的版本约束：候选之后出现更新版本 / 发布基线被移动时不可放行（防并发覆盖）
+function approveBlock(g) {
+  const doc = docById.value[g.docId]
+  return doc ? approveBlockReason(g, doc) : null
+}
+
 function checkIcon(key) {
   return { review: '📝', fresh: '🥬', gap: '📮', retire: '🗄️' }[key] || '•'
 }
@@ -133,6 +148,7 @@ async function decide(g, decision) {
     if (res.status === 'ok') decideNoteMap.value[g.id] = ''
     else if (res.status === 'denied' || res.status === 'guest') alert('只有管理员可以审批放行或驳回。')
     else if (res.status === 'blocked') alert('放行前复检发现新阻断，门禁已退回阻断态，请处置后再次送审。')
+    else if (res.status === 'stale') alert('放行被版本约束拦截：' + approveBlockReasonLabel(res.reason))
     else alert('操作失败：门禁状态已变化')
   } finally {
     busyId.value = ''
@@ -144,6 +160,8 @@ async function rollback(g) {
   const res = await releaseStore.rollbackGate(g.id, (rollbackNoteMap.value[g.id] || '').trim(), auth.user)
   if (res.status === 'ok') rollbackNoteMap.value[g.id] = ''
   else if (res.status === 'denied' || res.status === 'guest') alert('只有管理员可以回退版本。')
+  else if (res.status === 'superseded') alert('该版本之后已有更新版本发布，请按发布逆序先回退后续版本。')
+  else if (res.status === 'gate-open') alert('该文档存在在途发布门禁，请先完成或撤回后再回退。')
   else alert('操作失败：门禁状态已变化')
 }
 
@@ -267,19 +285,23 @@ onMounted(async () => {
         </div>
 
         <div v-if="g.status === GATE.PENDING_APPROVAL && isAdmin" class="acts">
+          <div v-if="approveBlock(g)" class="stale-hint">⚠️ {{ approveBlockReasonLabel(approveBlock(g)) }}</div>
           <textarea :value="decideNoteMap[g.id] || ''" rows="2" placeholder="审批意见（可选；放行前系统会再次复检四维度）" @input="decideNoteMap[g.id] = $event.target.value"></textarea>
           <div class="act-row">
             <button class="btn sm danger-ghost" :disabled="busyId === g.id" @click="decide(g, 'reject')">✕ 驳回（不发布）</button>
-            <button class="btn sm ok-solid" :disabled="busyId === g.id" @click="decide(g, 'approve')">✓ 审批放行并发布</button>
+            <button class="btn sm ok-solid" :disabled="busyId === g.id || !!approveBlock(g)" @click="decide(g, 'approve')">✓ 审批放行并发布</button>
           </div>
         </div>
 
         <div v-if="g.status === GATE.RELEASED && isAdmin" class="acts released-acts">
-          <div class="released-hint">已放行：问答引用切换至 v{{ g.version }}，共享链接已同步新版内容。如发现问题可回退。</div>
-          <div class="act-row">
-            <input :value="rollbackNoteMap[g.id] || ''" placeholder="回退原因（可选）" @input="rollbackNoteMap[g.id] = $event.target.value" />
-            <button class="btn sm danger-ghost" @click="rollback(g)">↩ 回退至 v{{ g.publishedVersion }}</button>
-          </div>
+          <template v-if="!rollbackBlock(g)">
+            <div class="released-hint">已放行：问答引用切换至 v{{ g.version }}，共享链接已同步新版内容。如发现问题可回退。</div>
+            <div class="act-row">
+              <input :value="rollbackNoteMap[g.id] || ''" placeholder="回退原因（可选）" @input="rollbackNoteMap[g.id] = $event.target.value" />
+              <button class="btn sm danger-ghost" @click="rollback(g)">↩ 回退至 v{{ g.publishedVersion }}</button>
+            </div>
+          </template>
+          <div v-else class="released-hint rb-blocked">已放行：问答引用已切换至 v{{ g.version }}。⚠️ 暂不可回退：{{ rollbackBlockReasonLabel(rollbackBlock(g)) }}</div>
         </div>
 
         <details class="timeline">
@@ -378,6 +400,8 @@ onMounted(async () => {
 .btn.danger-ghost { background: #fff; border-color: #f2555c; color: #b91c1c; }
 .btn.danger-ghost:hover { background: #fef2f2; }
 .released-hint { font-size: 12.5px; color: #15803d; margin-bottom: 8px; }
+.released-hint.rb-blocked { color: #b45309; margin-bottom: 0; }
+.stale-hint { font-size: 12.5px; color: #b45309; background: #fffbeb; border: 1px solid #fcd34d; border-radius: 8px; padding: 6px 10px; margin-bottom: 8px; }
 .timeline { margin-top: 10px; }
 .timeline summary { cursor: pointer; font-size: 12px; color: var(--text-3); }
 .tl { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; padding: 4px 0; font-size: 12px; }
